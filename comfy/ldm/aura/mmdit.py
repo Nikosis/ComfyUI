@@ -8,6 +8,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from comfy.ldm.modules.attention import optimized_attention
+import comfy.ops
+import comfy.ldm.common_dit
 
 def modulate(x, shift, scale):
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
@@ -145,7 +147,6 @@ class DoubleAttention(nn.Module):
 
         bsz, seqlen1, _ = c.shape
         bsz, seqlen2, _ = x.shape
-        seqlen = seqlen1 + seqlen2
 
         cq, ck, cv = self.w1q(c), self.w1k(c), self.w1v(c)
         cq = cq.view(bsz, seqlen1, self.n_heads, self.head_dim)
@@ -380,7 +381,6 @@ class MMDiT(nn.Module):
         pe_new = pe_as_2d.squeeze(0).permute(1, 2, 0).flatten(0, 1)
         self.positional_encoding.data = pe_new.unsqueeze(0).contiguous()
         self.h_max, self.w_max = target_dim
-        print("PE extended to", target_dim)
 
     def pe_selection_index_based_on_dim(self, h, w):
         h_p, w_p = h // self.patch_size, w // self.patch_size
@@ -406,10 +406,7 @@ class MMDiT(nn.Module):
 
     def patchify(self, x):
         B, C, H, W = x.size()
-        pad_h = (self.patch_size - H % self.patch_size) % self.patch_size
-        pad_w = (self.patch_size - W % self.patch_size) % self.patch_size
-
-        x = torch.nn.functional.pad(x, (0, pad_w, 0, pad_h), mode='reflect')
+        x = comfy.ldm.common_dit.pad_to_patch_size(x, (self.patch_size, self.patch_size))
         x = x.view(
             B,
             C,
@@ -427,7 +424,7 @@ class MMDiT(nn.Module):
         max_dim = max(h, w)
 
         cur_dim = self.h_max
-        pos_encoding = self.positional_encoding.reshape(1, cur_dim, cur_dim, -1).to(device=x.device, dtype=x.dtype)
+        pos_encoding = comfy.ops.cast_to_input(self.positional_encoding.reshape(1, cur_dim, cur_dim, -1), x)
 
         if max_dim > cur_dim:
             pos_encoding = F.interpolate(pos_encoding.movedim(-1, 1), (max_dim, max_dim), mode="bilinear").movedim(1, -1)
@@ -438,7 +435,8 @@ class MMDiT(nn.Module):
         pos_encoding = pos_encoding[:,from_h:from_h+h,from_w:from_w+w]
         return x + pos_encoding.reshape(1, -1, self.positional_encoding.shape[-1])
 
-    def forward(self, x, timestep, context, **kwargs):
+    def forward(self, x, timestep, context, transformer_options={}, **kwargs):
+        patches_replace = transformer_options.get("patches_replace", {})
         # patchify x, add PE
         b, c, h, w = x.shape
 
@@ -455,19 +453,40 @@ class MMDiT(nn.Module):
         t = timestep
 
         c = self.cond_seq_linear(c_seq)  # B, T_c, D
-        c = torch.cat([self.register_tokens.to(device=c.device, dtype=c.dtype).repeat(c.size(0), 1, 1), c], dim=1)
+        c = torch.cat([comfy.ops.cast_to_input(self.register_tokens, c).repeat(c.size(0), 1, 1), c], dim=1)
 
         global_cond = self.t_embedder(t, x.dtype)  # B, D
 
+        blocks_replace = patches_replace.get("dit", {})
         if len(self.double_layers) > 0:
-            for layer in self.double_layers:
-                c, x = layer(c, x, global_cond, **kwargs)
+            for i, layer in enumerate(self.double_layers):
+                if ("double_block", i) in blocks_replace:
+                    def block_wrap(args):
+                        out = {}
+                        out["txt"], out["img"] = layer(args["txt"],
+                                                       args["img"],
+                                                       args["vec"])
+                        return out
+                    out = blocks_replace[("double_block", i)]({"img": x, "txt": c, "vec": global_cond}, {"original_block": block_wrap})
+                    c = out["txt"]
+                    x = out["img"]
+                else:
+                    c, x = layer(c, x, global_cond, **kwargs)
 
         if len(self.single_layers) > 0:
             c_len = c.size(1)
             cx = torch.cat([c, x], dim=1)
-            for layer in self.single_layers:
-                cx = layer(cx, global_cond, **kwargs)
+            for i, layer in enumerate(self.single_layers):
+                if ("single_block", i) in blocks_replace:
+                    def block_wrap(args):
+                        out = {}
+                        out["img"] = layer(args["img"], args["vec"])
+                        return out
+
+                    out = blocks_replace[("single_block", i)]({"img": cx, "vec": global_cond}, {"original_block": block_wrap})
+                    cx = out["img"]
+                else:
+                    cx = layer(cx, global_cond, **kwargs)
 
             x = cx[:, c_len:]
 

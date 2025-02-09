@@ -1,9 +1,8 @@
-from typing import Any
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
+import comfy.ops
 from comfy.ldm.modules.diffusionmodules.mmdit import Mlp, TimestepEmbedder, PatchEmbed, RMSNorm
 from comfy.ldm.modules.diffusionmodules.util import timestep_embedding
 from torch.utils import checkpoint
@@ -20,6 +19,7 @@ def calc_rope(x, patch_size, head_size):
     sub_args = [start, stop, (th, tw)]
     # head_size = HUNYUAN_DIT_CONFIG['DiT-g/2']['hidden_size'] // HUNYUAN_DIT_CONFIG['DiT-g/2']['num_heads']
     rope = get_2d_rotary_pos_embed(head_size, *sub_args)
+    rope = (rope[0].to(x), rope[1].to(x))
     return rope
 
 
@@ -90,6 +90,8 @@ class HunYuanDiTBlock(nn.Module):
         # Long Skip Connection
         if self.skip_linear is not None:
             cat = torch.cat([x, skip], dim=-1)
+            if cat.dtype != x.dtype:
+                cat = cat.to(x.dtype)
             cat = self.skip_norm(cat)
             x = self.skip_linear(cat)
 
@@ -234,7 +236,7 @@ class HunYuanDiT(nn.Module):
 
         if self.use_style_cond:
             # Here we use a default learned embedder layer for future extension.
-            self.style_embedder = nn.Embedding(1, hidden_size, dtype=dtype, device=device)
+            self.style_embedder = operations.Embedding(1, hidden_size, dtype=dtype, device=device)
             self.extra_in_dim += hidden_size
 
         # Text embedding for `add`
@@ -245,9 +247,6 @@ class HunYuanDiT(nn.Module):
             nn.SiLU(),
             operations.Linear(hidden_size * 4, hidden_size, bias=True, dtype=dtype, device=device),
         )
-
-        # Image embedding
-        num_patches = self.x_embedder.num_patches
 
         # HUnYuanDiT Blocks
         self.blocks = nn.ModuleList([
@@ -283,7 +282,7 @@ class HunYuanDiT(nn.Module):
                 style=None,
                 return_dict=False,
                 control=None,
-                transformer_options=None,
+                transformer_options={},
                 ):
         """
         Forward pass of the encoder.
@@ -311,8 +310,7 @@ class HunYuanDiT(nn.Module):
         return_dict: bool
             Whether to return a dictionary.
         """
-        #import pdb
-        #pdb.set_trace()
+        patches_replace = transformer_options.get("patches_replace", {})
         encoder_hidden_states = context
         text_states = encoder_hidden_states                     # 2,77,1024
         text_states_t5 = encoder_hidden_states_t5               # 2,256,2048
@@ -321,7 +319,7 @@ class HunYuanDiT(nn.Module):
         b_t5, l_t5, c_t5 = text_states_t5.shape
         text_states_t5 = self.mlp_t5(text_states_t5.view(-1, c_t5)).view(b_t5, l_t5, -1)
 
-        padding = self.text_embedding_padding.to(text_states)
+        padding = comfy.ops.cast_to_input(self.text_embedding_padding, text_states)
 
         text_states[:,-self.text_len:] = torch.where(text_states_mask[:,-self.text_len:].unsqueeze(2), text_states[:,-self.text_len:], padding[:self.text_len])
         text_states_t5[:,-self.text_len_t5:] = torch.where(text_states_t5_mask[:,-self.text_len_t5:].unsqueeze(2), text_states_t5[:,-self.text_len_t5:], padding[self.text_len:])
@@ -354,24 +352,39 @@ class HunYuanDiT(nn.Module):
         if self.use_style_cond:
             if style is None:
                 style = torch.zeros((extra_vec.shape[0],), device=x.device, dtype=torch.int)
-            style_embedding = self.style_embedder(style)
+            style_embedding = self.style_embedder(style, out_dtype=x.dtype)
             extra_vec = torch.cat([extra_vec, style_embedding], dim=1)
 
         # Concatenate all extra vectors
         c = t + self.extra_embedder(extra_vec)  # [B, D]
 
+        blocks_replace = patches_replace.get("dit", {})
+
         controls = None
+        if control:
+            controls = control.get("output", None)
         # ========================= Forward pass through HunYuanDiT blocks =========================
         skips = []
         for layer, block in enumerate(self.blocks):
             if layer > self.depth // 2:
                 if controls is not None:
-                    skip = skips.pop() + controls.pop()
+                    skip = skips.pop() + controls.pop().to(dtype=x.dtype)
                 else:
                     skip = skips.pop()
-                x = block(x, c, text_states, freqs_cis_img, skip)   # (N, L, D)
             else:
-                x = block(x, c, text_states, freqs_cis_img)         # (N, L, D)
+                skip = None
+
+            if ("double_block", layer) in blocks_replace:
+                def block_wrap(args):
+                    out = {}
+                    out["img"] = block(args["img"], args["vec"], args["txt"], args["pe"], args["skip"])
+                    return out
+
+                out = blocks_replace[("double_block", layer)]({"img": x, "txt": text_states, "vec": c, "pe": freqs_cis_img, "skip": skip}, {"original_block": block_wrap})
+                x = out["img"]
+            else:
+                x = block(x, c, text_states, freqs_cis_img, skip)   # (N, L, D)
+
 
             if layer < (self.depth // 2 - 1):
                 skips.append(x)
